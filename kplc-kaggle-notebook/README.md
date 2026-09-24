@@ -30,7 +30,7 @@ uses it. No redeploy of the backend needed.
 ## One-time setup
 
 1. **Model Dataset.** Create it with the `kaggle-dataset-setup` repo. Its slug
-   (`wycliffearapcheruiyot/qwen3-4b`) is already in `dataset_sources` here.
+   (`wycliffecheruiyot/qwen3-4b`) is already in `dataset_sources` here.
 2. **Cloudflare named tunnel.** Zero Trust dashboard -> Networks -> Tunnels ->
    Create (Cloudflared). Copy the **token**. Add a Public Hostname
    (e.g. `model.yourdomain.com`) -> HTTP -> `localhost:8000`. That hostname is
