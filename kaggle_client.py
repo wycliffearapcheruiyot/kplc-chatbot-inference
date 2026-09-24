@@ -31,6 +31,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 SECRETS_DATASET_SLUG = "kplc-chatbot-secrets"
@@ -113,6 +114,20 @@ def push_secrets_dataset(
     return dataset_ref
 
 
+def _kernel_status(push_path: str, kaggle_username: str) -> str:
+    """Best-effort `kaggle kernels status` for error messages."""
+    try:
+        meta = json.loads(Path(push_path, "kernel-metadata.json").read_text())
+        ref = meta.get("id") or f"{kaggle_username}/unknown"
+        r = subprocess.run(
+            ["kaggle", "kernels", "status", ref],
+            capture_output=True, text=True, timeout=30,
+        )
+        return (r.stdout or r.stderr).strip() or "unknown"
+    except Exception as exc:  # never let diagnostics mask the real error
+        return f"could not determine ({exc})"
+
+
 def push_kernel(
     kernel_path: str,
     kaggle_username: str,
@@ -157,20 +172,42 @@ def push_kernel(
         meta["dataset_sources"] = sorted(sources)
         meta_path.write_text(json.dumps(meta, indent=2))
 
+    # Kaggle answers 409 Conflict when the previous run is still queued /
+    # running, or when the just-updated secrets dataset version is still
+    # processing. Both clear on their own within a minute or so, so retry a
+    # few times before giving up. Kept short (~50s total) to stay under
+    # Render's ~100s HTTP request limit.
+    max_attempts = 3
+    retry_delay_seconds = 20
+    result = None
     try:
-        result = subprocess.run(
-            ["kaggle", "kernels", "push", "-p", push_path],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=True,
-        )
-    except subprocess.CalledProcessError as e:
-        raise KagglePushError(
-            f"kaggle kernels push failed (exit {e.returncode}): {e.stdout}\n{e.stderr}"
-        ) from e
-    except subprocess.TimeoutExpired as e:
-        raise KagglePushError(f"kaggle kernels push timed out after {timeout}s") from e
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = subprocess.run(
+                    ["kaggle", "kernels", "push", "-p", push_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=True,
+                )
+                break
+            except subprocess.CalledProcessError as e:
+                output = f"{e.stdout}\n{e.stderr}"
+                is_conflict = "409" in output or "Conflict" in output
+                if is_conflict and attempt < max_attempts:
+                    time.sleep(retry_delay_seconds)
+                    continue
+                detail = f"kaggle kernels push failed (exit {e.returncode}): {output}"
+                if is_conflict:
+                    detail += (
+                        f"\nKernel status: {_kernel_status(push_path, kaggle_username)}"
+                        "\nHint: a 409 usually means the previous run is still "
+                        "queued/running on Kaggle. Wait for it to finish (or stop "
+                        "it in the Kaggle UI) and try again."
+                    )
+                raise KagglePushError(detail) from e
+            except subprocess.TimeoutExpired as e:
+                raise KagglePushError(f"kaggle kernels push timed out after {timeout}s") from e
     finally:
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
