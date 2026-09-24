@@ -1,6 +1,6 @@
 {
   "id": "wycliffearapcheruiyot/kplc-chatbot-serving",
-  "title": "KPLC Chatbot - Qwen3-4B Serving",
+  "title": "KPLC Chatbot Serving",
   "code_file": "serve.py",
   "language": "python",
   "kernel_type": "script",
