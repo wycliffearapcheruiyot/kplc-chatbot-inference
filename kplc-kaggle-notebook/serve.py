@@ -344,17 +344,28 @@ def print_cloudflared_log_tail(lines: int = 20):
 # --- webhooks back to the Render backend --------------------------------------
 
 def call_webhook(path: str, extra: dict | None = None):
+    # The Render backend may be asleep (free tier cold start takes 30-60s),
+    # so use a generous timeout and retry a few times.
     url = f"{BACKEND_URL}{path}"
-    try:
-        resp = requests.post(
-            url,
-            json=extra or {},
-            headers={"X-Webhook-Secret": SESSION_WEBHOOK_SECRET},
-            timeout=15,
-        )
-        print(f"POST {path} -> {resp.status_code}", flush=True)
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to call webhook {path}: {e}", file=sys.stderr, flush=True)
+    attempts = 4
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(
+                url,
+                json=extra or {},
+                headers={"X-Webhook-Secret": SESSION_WEBHOOK_SECRET},
+                timeout=90,
+            )
+            print(f"POST {path} -> {resp.status_code}", flush=True)
+            return
+        except requests.exceptions.RequestException as e:
+            print(
+                f"Failed to call webhook {path} (attempt {attempt}/{attempts}): {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if attempt < attempts:
+                time.sleep(5)
 
 
 # --- idle watchdog -----------------------------------------------------------------
