@@ -121,7 +121,17 @@ def get_secret(name: str) -> str:
 
 BACKEND_URL = get_secret("BACKEND_URL").rstrip("/")
 SESSION_WEBHOOK_SECRET = get_secret("SESSION_WEBHOOK_SECRET")
-CLOUDFLARE_TUNNEL_TOKEN = get_secret("CLOUDFLARE_TUNNEL_TOKEN")
+_raw_token = get_secret("CLOUDFLARE_TUNNEL_TOKEN").strip().strip("'\"")
+# Tolerate pasting Cloudflare's whole install command
+# ("cloudflared.exe service install eyJ..."): the token is the last word.
+CLOUDFLARE_TUNNEL_TOKEN = _raw_token.split()[-1].strip("'\"") if _raw_token else ""
+if CLOUDFLARE_TUNNEL_TOKEN:
+    # Safe diagnostic: never prints the token itself.
+    print(
+        f"Tunnel token: {len(CLOUDFLARE_TUNNEL_TOKEN)} chars, "
+        f"starts with eyJ: {CLOUDFLARE_TUNNEL_TOKEN.startswith('eyJ')}",
+        flush=True,
+    )
 
 for name, value in [
     ("BACKEND_URL", BACKEND_URL),
