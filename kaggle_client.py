@@ -52,15 +52,31 @@ def _ensure_kaggle_credentials(username: str, key: str):
     config_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
+def _cli_env(username: str, key: str) -> dict:
+    """Environment for one `kaggle` CLI call, bound to ONE account.
+
+    The CLI lets KAGGLE_USERNAME / KAGGLE_KEY env vars override kaggle.json and
+    tries KAGGLE_API_TOKEN before either, so with several accounts the
+    credentials must be passed explicitly to every call; writing kaggle.json
+    alone would leave the first account in use. Per-call env also avoids two
+    threads fighting over one shared file.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "KAGGLE_API_TOKEN"}
+    env["KAGGLE_USERNAME"] = username
+    env["KAGGLE_KEY"] = key
+    return env
+
+
 def secrets_dataset_ref(kaggle_username: str) -> str:
     return f"{kaggle_username}/{SECRETS_DATASET_SLUG}"
 
 
-def _dataset_exists(dataset_ref: str) -> bool:
+def _dataset_exists(dataset_ref: str, env: dict) -> bool:
     result = subprocess.run(
         ["kaggle", "datasets", "status", dataset_ref],
         capture_output=True,
         text=True,
+        env=env,
     )
     return result.returncode == 0
 
@@ -81,6 +97,7 @@ def push_secrets_dataset(
         raise KagglePushError("KAGGLE_USERNAME / KAGGLE_KEY are not set.")
 
     _ensure_kaggle_credentials(kaggle_username, kaggle_key)
+    env = _cli_env(kaggle_username, kaggle_key)
     dataset_ref = secrets_dataset_ref(kaggle_username)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -96,14 +113,14 @@ def push_secrets_dataset(
             )
         )
 
-        exists = _dataset_exists(dataset_ref)
+        exists = _dataset_exists(dataset_ref, env)
         cmd = (
             ["kaggle", "datasets", "version", "-p", str(tmp_path), "-m", "sync session secrets", "-r", "zip"]
             if exists
             else ["kaggle", "datasets", "create", "-p", str(tmp_path), "-r", "zip"]
         )
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
+            subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True, env=env)
         except subprocess.CalledProcessError as e:
             raise KagglePushError(
                 f"Failed to push secrets dataset (exit {e.returncode}): {e.stdout}\n{e.stderr}"
@@ -114,14 +131,14 @@ def push_secrets_dataset(
     return dataset_ref
 
 
-def _kernel_status(push_path: str, kaggle_username: str) -> str:
+def _kernel_status(push_path: str, kaggle_username: str, env: dict | None = None) -> str:
     """Best-effort `kaggle kernels status` for error messages."""
     try:
         meta = json.loads(Path(push_path, "kernel-metadata.json").read_text())
         ref = meta.get("id") or f"{kaggle_username}/unknown"
         r = subprocess.run(
             ["kaggle", "kernels", "status", ref],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=env,
         )
         return (r.stdout or r.stderr).strip() or "unknown"
     except Exception as exc:  # never let diagnostics mask the real error
@@ -158,19 +175,23 @@ def push_kernel(
         raise KagglePushError(f"No kernel-metadata.json found under {kernel_path}")
 
     _ensure_kaggle_credentials(kaggle_username, kaggle_key)
+    env = _cli_env(kaggle_username, kaggle_key)
 
-    push_path = kernel_path
-    tmp_dir = None
+    # Always push from a temp copy: the kernel id in kernel-metadata.json is
+    # "<owner>/<slug>" and the owner must be the account doing the push, so it
+    # is rewritten per account (the checkout itself is never mutated).
+    tmp_dir = tempfile.mkdtemp()
+    push_path = str(Path(tmp_dir) / "kernel")
+    shutil.copytree(kernel_path, push_path)
+    meta_path = Path(push_path, "kernel-metadata.json")
+    meta = json.loads(meta_path.read_text())
+    slug = str(meta.get("id", "")).split("/")[-1] or "kplc-chatbot-serving"
+    meta["id"] = f"{kaggle_username}/{slug}"
     if extra_dataset_sources:
-        tmp_dir = tempfile.mkdtemp()
-        push_path = str(Path(tmp_dir) / "kernel")
-        shutil.copytree(kernel_path, push_path)
-        meta_path = Path(push_path, "kernel-metadata.json")
-        meta = json.loads(meta_path.read_text())
         sources = set(meta.get("dataset_sources", []))
         sources.update(extra_dataset_sources)
         meta["dataset_sources"] = sorted(sources)
-        meta_path.write_text(json.dumps(meta, indent=2))
+    meta_path.write_text(json.dumps(meta, indent=2))
 
     # Kaggle answers 409 Conflict when the previous run is still queued /
     # running, or when the just-updated secrets dataset version is still
@@ -189,6 +210,7 @@ def push_kernel(
                     text=True,
                     timeout=timeout,
                     check=True,
+                    env=env,
                 )
                 break
             except subprocess.CalledProcessError as e:
@@ -200,7 +222,7 @@ def push_kernel(
                 detail = f"kaggle kernels push failed (exit {e.returncode}): {output}"
                 if is_conflict:
                     detail += (
-                        f"\nKernel status: {_kernel_status(push_path, kaggle_username)}"
+                        f"\nKernel status: {_kernel_status(push_path, kaggle_username, env)}"
                         "\nHint: a 409 usually means the previous run is still "
                         "queued/running on Kaggle. Wait for it to finish (or stop "
                         "it in the Kaggle UI) and try again."

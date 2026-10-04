@@ -18,7 +18,12 @@ Responsibilities:
                                 only while a session is READY.
 
 Env vars (see .env.example):
-    KAGGLE_USERNAME, KAGGLE_KEY   - Kaggle API credentials
+    KAGGLE_USERNAME, KAGGLE_KEY   - Kaggle API credentials (one account)
+    KAGGLE_ACCOUNTS               - optional JSON of several accounts to rotate
+                                     through, {"user": "key", ...}; replaces
+                                     KAGGLE_USERNAME / KAGGLE_KEY (see accounts.py)
+    SESSIONS_PER_ACCOUNT          - default 3. Launches an account serves in a
+                                     row before the next account takes over.
     KAGGLE_KERNEL_PATH            - path to the kernel folder to push
                                      (default: ./kplc-kaggle-notebook)
     SESSION_WEBHOOK_SECRET        - shared secret; must match the Kaggle
@@ -30,22 +35,40 @@ Env vars (see .env.example):
     PROXY_TIMEOUT_SECONDS         - optional, default 120. Timeout for
                                      proxied /generate calls.
 
+  Always-on mode (all optional; see .env.example):
+    AUTO_KEEP_ALIVE               - "true" keeps a Kaggle session running and
+                                     relaunches it after every exit.
+    RESTART_EVERY_HOURS           - default 8. serve.py exits cleanly after
+                                     this long; the supervisor relaunches it.
+    KAGGLE_IDLE_TIMEOUT_SECONDS   - default 0 (never) when always-on, 900
+                                     otherwise.
+    KEEP_ALIVE_WINDOW_UTC         - e.g. "05:00-13:00": only launch inside it.
+
 Run with a single worker (see README) since session state is in-memory.
 """
 
 import os
+import time
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
+from accounts import Rotation, load_accounts
 from kaggle_client import KagglePushError, push_kernel, push_secrets_dataset
 from session_manager import SessionManager
+from supervisor import Supervisor
 
 # --- config -----------------------------------------------------------------
 
 KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
 KAGGLE_KEY = os.environ.get("KAGGLE_KEY", "")
+rotation = Rotation(
+    load_accounts(os.environ.get("KAGGLE_ACCOUNTS", ""), KAGGLE_USERNAME, KAGGLE_KEY),
+    sessions_per_account=int(os.environ.get("SESSIONS_PER_ACCOUNT", "3")),
+    skip_after_failures=int(os.environ.get("ACCOUNT_SKIP_AFTER_FAILURES", "3")),
+)
 KAGGLE_KERNEL_PATH = os.environ.get("KAGGLE_KERNEL_PATH", "./kplc-kaggle-notebook")
 SESSION_WEBHOOK_SECRET = os.environ.get("SESSION_WEBHOOK_SECRET", "")
 MODEL_TUNNEL_URL = os.environ.get("MODEL_TUNNEL_URL", "").rstrip("/")
@@ -59,6 +82,17 @@ PROXY_TIMEOUT_SECONDS = int(os.environ.get("PROXY_TIMEOUT_SECONDS", "120"))
 BACKEND_URL = os.environ.get("BACKEND_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
 CLOUDFLARE_TUNNEL_TOKEN = os.environ.get("CLOUDFLARE_TUNNEL_TOKEN", "")
 
+# --- always-on mode -----------------------------------------------------------
+KEEP_ALIVE = os.environ.get("AUTO_KEEP_ALIVE", "false").strip().lower() in ("1", "true", "yes", "on")
+RESTART_EVERY_HOURS = float(os.environ.get("RESTART_EVERY_HOURS", "8"))
+# Always-on: no idle shutdown (the supervisor would only relaunch it anyway,
+# burning a model load per idle gap). Otherwise keep the original 15 min.
+KAGGLE_IDLE_TIMEOUT_SECONDS = int(
+    os.environ.get("KAGGLE_IDLE_TIMEOUT_SECONDS", "0" if KEEP_ALIVE else "900")
+)
+# Kaggle ends a GPU session at 12h, so a longer cycle can't be honoured.
+MAX_RUNTIME_SECONDS = int(min(RESTART_EVERY_HOURS, 11.5) * 3600) if KEEP_ALIVE else 0
+
 for name, value in [
     ("SESSION_WEBHOOK_SECRET", SESSION_WEBHOOK_SECRET),
     ("MODEL_TUNNEL_URL", MODEL_TUNNEL_URL),
@@ -68,8 +102,70 @@ for name, value in [
     if not value:
         print(f"WARNING: env var {name} is not set. See .env.example.")
 
-app = FastAPI(title="KPLC Chatbot Backend")
 sessions = SessionManager(start_timeout_seconds=SESSION_START_TIMEOUT_SECONDS)
+
+
+def _launch_session() -> bool:
+    """Pushes the secrets dataset + kernel on the account the rotation picks.
+    Shared by POST /session/start and the always-on supervisor. Returns False
+    if a session is already starting/ready; raises KagglePushError (state ->
+    error) on failure."""
+    if not sessions.try_begin_start():
+        return False
+    try:
+        number, idx, account = rotation.plan()
+    except RuntimeError as e:
+        sessions.mark_error(str(e))
+        raise KagglePushError(str(e)) from e
+    label = f"account {idx + 1}/{len(rotation.accounts)}"
+    try:
+        secrets_dataset_ref = push_secrets_dataset(
+            account["username"],
+            account["key"],
+            {
+                "BACKEND_URL": BACKEND_URL,
+                "SESSION_WEBHOOK_SECRET": SESSION_WEBHOOK_SECRET,
+                "CLOUDFLARE_TUNNEL_TOKEN": CLOUDFLARE_TUNNEL_TOKEN,
+                # strings on purpose: serve.py treats "0" as a real value
+                "IDLE_TIMEOUT_SECONDS": str(KAGGLE_IDLE_TIMEOUT_SECONDS),
+                "MAX_RUNTIME_SECONDS": str(MAX_RUNTIME_SECONDS),
+                "SESSION_NUMBER": str(number),
+            },
+        )
+        push_kernel(
+            KAGGLE_KERNEL_PATH,
+            account["username"],
+            account["key"],
+            extra_dataset_sources=[secrets_dataset_ref],
+        )
+    except KagglePushError as e:
+        sessions.mark_error(f"[{label}] {e}")
+        raise
+    rotation.launched()
+    print(f"Launched session #{number} on {label}.", flush=True)
+    return True
+
+
+supervisor = Supervisor(
+    sessions,
+    launch=_launch_session,
+    tunnel_url=MODEL_TUNNEL_URL,
+    rotation=rotation,
+    interval_seconds=int(os.environ.get("SUPERVISOR_INTERVAL_SECONDS", "60")),
+    retry_backoff_seconds=int(os.environ.get("RESTART_RETRY_BACKOFF_SECONDS", "300")),
+    window_spec=os.environ.get("KEEP_ALIVE_WINDOW_UTC", ""),
+)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if KEEP_ALIVE:
+        supervisor.start()
+    yield
+    supervisor.stop()
+
+
+app = FastAPI(title="KPLC Chatbot Backend", lifespan=lifespan)
 
 
 # --- auth helper for webhooks called by serve.py -----------------------------
@@ -95,53 +191,54 @@ def start_session():
     kernel so serve.py can read the same config every run via
     /kaggle/input/.../secrets.json.
     """
-    claimed = sessions.try_begin_start()
-    if not claimed:
-        return {"triggered": False, **sessions.snapshot()}
-
     try:
-        secrets_dataset_ref = push_secrets_dataset(
-            KAGGLE_USERNAME,
-            KAGGLE_KEY,
-            {
-                "BACKEND_URL": BACKEND_URL,
-                "SESSION_WEBHOOK_SECRET": SESSION_WEBHOOK_SECRET,
-                "CLOUDFLARE_TUNNEL_TOKEN": CLOUDFLARE_TUNNEL_TOKEN,
-            },
-        )
-        push_kernel(
-            KAGGLE_KERNEL_PATH,
-            KAGGLE_USERNAME,
-            KAGGLE_KEY,
-            extra_dataset_sources=[secrets_dataset_ref],
-        )
+        triggered = _launch_session()
     except KagglePushError as e:
-        sessions.mark_error(str(e))
         raise HTTPException(status_code=502, detail=f"Failed to start Kaggle session: {e}") from e
 
-    return {"triggered": True, **sessions.snapshot()}
+    return {"triggered": triggered, **sessions.snapshot()}
 
 
 @app.post("/session/ready")
-def session_ready(x_webhook_secret: str | None = Header(default=None)):
+def session_ready(
+    payload: dict | None = Body(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+):
     """Called by serve.py once the model is loaded and the tunnel is up."""
     _check_webhook_secret(x_webhook_secret)
+    rotation.sync((payload or {}).get("session_number"))
+    rotation.succeeded()
     sessions.mark_ready()
     return {"ok": True}
 
 
 @app.post("/session/ended")
-def session_ended(x_webhook_secret: str | None = Header(default=None)):
-    """Called by serve.py when it shuts itself down (idle timeout or fatal
-    startup error)."""
+def session_ended(
+    payload: dict | None = Body(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+):
+    """Called by serve.py when it shuts itself down (scheduled restart, idle
+    timeout or fatal startup error). Its session_number re-syncs the account
+    rotation, so a Render service that slept or restarted meanwhile still
+    picks the right account for the next launch."""
     _check_webhook_secret(x_webhook_secret)
+    rotation.sync((payload or {}).get("session_number"))
     sessions.mark_ended()
     return {"ok": True}
 
 
 @app.get("/session/status")
 def session_status():
-    return sessions.snapshot()
+    snap = sessions.snapshot()
+    restart_in = None
+    if KEEP_ALIVE and snap["state"] == "ready" and snap["started_at"]:
+        restart_in = max(0, int(snap["started_at"] + MAX_RUNTIME_SECONDS - time.time()))
+    return {
+        **snap,
+        "keep_alive": KEEP_ALIVE,
+        "restart_in_seconds": restart_in,
+        "rotation": rotation.describe(),
+    }
 
 
 @app.get("/health")

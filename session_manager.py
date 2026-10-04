@@ -73,6 +73,19 @@ class SessionManager:
             self._state = SessionState.ERROR
             self._error_detail = detail
 
+    def adopt_running(self, started_at: float):
+        """A model server is already up (found by probing the tunnel), e.g.
+        because this Render process restarted while Kaggle kept running.
+        Takes over as READY instead of trying to push a second run."""
+        with self._lock:
+            if self._state in (SessionState.STARTING, SessionState.READY):
+                return
+            self._state = SessionState.READY
+            self._started_at = started_at
+            self._ready_at = time.time()
+            self._ended_at = None
+            self._error_detail = None
+
     def reset_to_idle(self):
         with self._lock:
             self._state = SessionState.IDLE

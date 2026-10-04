@@ -16,10 +16,12 @@ On every run, in order:
        dashboard, not here).
     4. Once the local server and tunnel are both confirmed up, POSTs to the
        backend's /session/ready webhook (with the shared secret header).
-    5. Runs an idle-watchdog: any /generate or /embed call resets the idle
-       clock. After IDLE_TIMEOUT_SECONDS with no calls, it stops cloudflared,
-       POSTs /session/ended, and exits — ending this Kaggle session and
-       freeing the weekly GPU quota.
+    5. Runs a watchdog that ends the session when either limit is hit:
+       - IDLE_TIMEOUT_SECONDS with no /generate or /embed call (0 = never), or
+       - MAX_RUNTIME_SECONDS since process start (0 = never): a scheduled
+         restart. In-flight requests are drained first.
+       It then stops cloudflared, POSTs /session/ended and exits. In always-on
+       mode the Render backend relaunches the kernel right after.
 
 Required Kaggle Secrets (Add-ons -> Secrets, in the Kaggle notebook editor):
     BACKEND_URL              e.g. https://kplc-chatbot-backend.onrender.com
@@ -44,7 +46,7 @@ from pathlib import Path
 import requests
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -62,7 +64,8 @@ except ImportError:
 # --- config -----------------------------------------------------------------
 
 LOCAL_PORT = 8000
-IDLE_TIMEOUT_SECONDS = 15 * 60
+DRAIN_TIMEOUT_SECONDS = 60
+_PROCESS_STARTED_AT = time.time()
 IDLE_CHECK_INTERVAL_SECONDS = 30
 READY_CONFIRM_GRACE_SECONDS = 10
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
@@ -119,6 +122,29 @@ def get_secret(name: str) -> str:
     return _dataset_secrets.get(name) or _get_kaggle_secret(name) or os.environ.get(name, "")
 
 
+def _int_secret(name: str, default: int) -> int:
+    # Values arrive from the backend as strings ("0" is truthy, so 0 survives
+    # get_secret's `or` chain, unlike a JSON integer 0 would).
+    raw = str(get_secret(name)).strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+# 0 disables a limit.
+#   IDLE_TIMEOUT_SECONDS: shut down after this long with no /generate or /embed
+#       call. Default 15 min (the original behaviour); the backend sends 0 when
+#       it runs in always-on mode.
+#   MAX_RUNTIME_SECONDS: exit cleanly after this long (counted from process
+#       start, which is also how Kaggle counts its 12h session cap). The
+#       backend relaunches the kernel after /session/ended.
+IDLE_TIMEOUT_SECONDS = _int_secret("IDLE_TIMEOUT_SECONDS", 15 * 60)
+MAX_RUNTIME_SECONDS = _int_secret("MAX_RUNTIME_SECONDS", 0)
+# Which launch this is (assigned by the backend's account rotation). Reported
+# back in /health and the webhooks so the backend never has to store it.
+SESSION_NUMBER = _int_secret("SESSION_NUMBER", -1)
+
 BACKEND_URL = get_secret("BACKEND_URL").rstrip("/")
 SESSION_WEBHOOK_SECRET = get_secret("SESSION_WEBHOOK_SECRET")
 _raw_token = get_secret("CLOUDFLARE_TUNNEL_TOKEN").strip().strip("'\"")
@@ -171,6 +197,27 @@ def find_model_dir() -> str:
 _last_activity_lock = threading.Lock()
 _last_activity_time = time.time()
 _shutting_down = threading.Event()
+
+
+_inflight = 0
+_inflight_lock = threading.Lock()
+
+
+def _inflight_guard():
+    """FastAPI dependency: counts requests being served so a scheduled
+    restart can wait for them instead of cutting a reply off mid-generation."""
+    global _inflight
+    with _inflight_lock:
+        _inflight += 1
+    try:
+        yield
+    finally:
+        with _inflight_lock:
+            _inflight -= 1
+
+
+def _uptime() -> float:
+    return time.time() - _PROCESS_STARTED_AT
 
 
 def _touch_activity():
@@ -242,10 +289,19 @@ class EmbedResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    up = _uptime()
+    return {
+        "status": "ok",
+        "uptime_seconds": int(up),
+        "max_runtime_seconds": MAX_RUNTIME_SECONDS,
+        "session_number": SESSION_NUMBER if SESSION_NUMBER >= 0 else None,
+        "seconds_until_restart": (
+            max(0, int(MAX_RUNTIME_SECONDS - up)) if MAX_RUNTIME_SECONDS else None
+        ),
+    }
 
 
-@app.post("/generate", response_model=GenerateResponse)
+@app.post("/generate", response_model=GenerateResponse, dependencies=[Depends(_inflight_guard)])
 def generate(req: GenerateRequest):
     _touch_activity()
     try:
@@ -278,7 +334,7 @@ def generate(req: GenerateRequest):
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}") from e
 
 
-@app.post("/embed", response_model=EmbedResponse)
+@app.post("/embed", response_model=EmbedResponse, dependencies=[Depends(_inflight_guard)])
 def embed(req: EmbedRequest):
     _touch_activity()
     if not req.texts:
@@ -352,11 +408,16 @@ def call_webhook(path: str, extra: dict | None = None):
         try:
             resp = requests.post(
                 url,
-                json=extra or {},
+                json={**(extra or {}), "session_number": SESSION_NUMBER},
                 headers={"X-Webhook-Secret": SESSION_WEBHOOK_SECRET},
                 timeout=90,
             )
             print(f"POST {path} -> {resp.status_code}", flush=True)
+            # A sleeping Render service can answer 502/503 while it boots; that
+            # is not delivery, so retry. (Other statuses, e.g. 403, won't improve.)
+            if resp.status_code >= 500 and attempt < attempts:
+                time.sleep(15)
+                continue
             return
         except requests.exceptions.RequestException as e:
             print(
@@ -370,30 +431,55 @@ def call_webhook(path: str, extra: dict | None = None):
 
 # --- idle watchdog -----------------------------------------------------------------
 
+def _drain_inflight():
+    """Gives requests already being served a chance to finish before a
+    scheduled restart. New requests can still arrive through the tunnel
+    during this window; the backend stops sending them once it sees
+    /session/ended."""
+    deadline = time.time() + DRAIN_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        with _inflight_lock:
+            if _inflight == 0:
+                return
+        time.sleep(1)
+    print("Drain timeout reached with requests still running.", flush=True)
+
+
 def idle_watchdog(tunnel_proc: subprocess.Popen):
+    reason = "stopped"
     while not _shutting_down.is_set():
         time.sleep(IDLE_CHECK_INTERVAL_SECONDS)
         idle_for = _seconds_since_activity()
         if tunnel_proc.poll() is not None:
             print("cloudflared exited unexpectedly, shutting down.", flush=True)
+            reason = "tunnel_died"
             break
-        if idle_for >= IDLE_TIMEOUT_SECONDS:
+        if MAX_RUNTIME_SECONDS and _uptime() >= MAX_RUNTIME_SECONDS:
+            print(
+                f"Reached scheduled runtime ({MAX_RUNTIME_SECONDS}s), restarting.",
+                flush=True,
+            )
+            reason = "scheduled_restart"
+            _drain_inflight()
+            break
+        if IDLE_TIMEOUT_SECONDS and idle_for >= IDLE_TIMEOUT_SECONDS:
             print(f"Idle for {idle_for:.0f}s, shutting down.", flush=True)
+            reason = "idle_timeout"
             break
-    shutdown(tunnel_proc)
+    shutdown(tunnel_proc, reason)
 
 
-def shutdown(tunnel_proc: subprocess.Popen):
+def shutdown(tunnel_proc: subprocess.Popen, reason: str = "stopped"):
     if _shutting_down.is_set():
         return
     _shutting_down.set()
-    print("Stopping tunnel and reporting session ended...", flush=True)
+    print(f"Stopping tunnel and reporting session ended ({reason})...", flush=True)
     try:
         tunnel_proc.terminate()
         tunnel_proc.wait(timeout=10)
     except Exception:
         tunnel_proc.kill()
-    call_webhook("/session/ended")
+    call_webhook("/session/ended", {"reason": reason})
     print("Session ended, exiting.", flush=True)
     os._exit(0)
 
@@ -429,7 +515,11 @@ def main():
 
     _touch_activity()  # start the idle clock from "now", not from model-load time
     call_webhook("/session/ready")
-    print("Session ready. Serving until idle timeout or manual stop.", flush=True)
+    print(
+        f"Session ready. idle_timeout={IDLE_TIMEOUT_SECONDS or 'off'}s, "
+        f"max_runtime={MAX_RUNTIME_SECONDS or 'off'}s.",
+        flush=True,
+    )
 
     idle_watchdog(tunnel_proc)  # blocks until idle timeout or tunnel death
 
