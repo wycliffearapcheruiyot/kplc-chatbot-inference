@@ -34,14 +34,20 @@ class SessionState(str, Enum):
 
 
 class SessionManager:
-    def __init__(self, start_timeout_seconds: int = 600):
+    def __init__(self, start_timeout_seconds=600):
+        # an int, or a zero-argument callable returning one (re-read on every check)
         self._lock = threading.Lock()
         self._state = SessionState.IDLE
         self._started_at: Optional[float] = None
         self._ready_at: Optional[float] = None
         self._ended_at: Optional[float] = None
         self._error_detail: Optional[str] = None
-        self.start_timeout_seconds = start_timeout_seconds
+        self._start_timeout = start_timeout_seconds
+
+    @property
+    def start_timeout_seconds(self) -> int:
+        t = self._start_timeout
+        return int(t() if callable(t) else t)
 
     # --- transitions -----------------------------------------------------
 

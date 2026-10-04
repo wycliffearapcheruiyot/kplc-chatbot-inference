@@ -70,6 +70,14 @@ class Rotation:
         self._fail_streak = 0
         self._lock = threading.Lock()
 
+    def configure(self, accounts: list[dict], sessions_per_account: int, skip_after_failures: int) -> None:
+        """Applies settings edited in the admin panel. The launch counter and
+        failure streak are kept, so a change never resets the rotation."""
+        with self._lock:
+            self.accounts = accounts
+            self.sessions_per_account = max(1, int(sessions_per_account))
+            self.skip_after_failures = max(1, int(skip_after_failures))
+
     def plan(self) -> tuple[int, int, dict]:
         """(launch number, account index, account) for the next launch."""
         with self._lock:

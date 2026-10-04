@@ -65,6 +65,7 @@ class Supervisor:
         after_end_delay_seconds: int = 30,
         window_spec: str = "",
         health_failures_before_error: int = 3,
+        settings=None,              # () -> dict, re-read every loop (see _apply)
     ):
         self.sessions = sessions
         self.launch = launch
@@ -73,14 +74,39 @@ class Supervisor:
         self.interval = interval_seconds
         self.retry_backoff = retry_backoff_seconds
         self.after_end_delay = after_end_delay_seconds
+        self._window_spec = window_spec
         self.window = parse_window(window_spec)
         self.max_misses = health_failures_before_error
+        self.settings = settings
+        self.enabled = True
 
         self._misses = 0
         self._attempt_open = False   # a launch this thread made hasn't been judged yet
         self._last_attempt = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    # --- settings ----------------------------------------------------------
+
+    def _apply(self):
+        """Pulls the current settings (edited live in the admin panel) from the
+        `settings` callable: enabled, tunnel_url, interval_seconds,
+        retry_backoff_seconds, window_spec. Missing keys keep their value."""
+        if not self.settings:
+            return
+        s = self.settings()
+        if "tunnel_url" in s:
+            self.tunnel_url = (s["tunnel_url"] or "").rstrip("/")
+        if "interval_seconds" in s:
+            self.interval = max(5, int(s["interval_seconds"]))
+        if "retry_backoff_seconds" in s:
+            self.retry_backoff = int(s["retry_backoff_seconds"])
+        if "window_spec" in s and s["window_spec"] != self._window_spec:
+            self._window_spec = s["window_spec"]
+            self.window = parse_window(self._window_spec)
+        if "enabled" in s and bool(s["enabled"]) != self.enabled:
+            self.enabled = bool(s["enabled"])
+            print(f"Supervisor: always-on mode {'enabled' if self.enabled else 'disabled'}.", flush=True)
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -89,7 +115,7 @@ class Supervisor:
             return
         self._thread = threading.Thread(target=self._run, name="kaggle-supervisor", daemon=True)
         self._thread.start()
-        print("Supervisor: always-on mode enabled.", flush=True)
+        print("Supervisor: thread started (it acts only while always-on mode is enabled).", flush=True)
 
     def stop(self):
         self._stop.set()
@@ -97,7 +123,9 @@ class Supervisor:
     def _run(self):
         while not self._stop.is_set():
             try:
-                self.tick()
+                self._apply()
+                if self.enabled:
+                    self.tick()
             except Exception as e:  # never let the loop die
                 print(f"Supervisor tick failed: {e!r}", flush=True)
             self._stop.wait(self.interval)

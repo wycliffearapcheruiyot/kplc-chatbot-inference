@@ -148,6 +148,22 @@ in the Render dashboard, e.g. `3.12.7`, and redeploy. `requirements.txt`
 already uses `>=` pins so pip picks a version with a prebuilt wheel for
 that Python version.
 
+## Editing settings from the admin panel
+
+Every variable in `.env.example` except `MONGODB_URI` can be changed live from the
+admin panel's **Environment** tab: values are stored in MongoDB and read through
+`app_config.cfg` (panel override → env var → default), about 10 s after saving.
+This service therefore needs `MONGODB_URI` (same Atlas cluster as the gateway).
+
+- `AUTO_KEEP_ALIVE`, `KEEP_ALIVE_WINDOW_UTC`, the supervisor timings, `MODEL_TUNNEL_URL`,
+  the Kaggle accounts and the timeouts apply **immediately**. The supervisor thread always
+  runs and simply idles while always-on mode is off.
+- `CLOUDFLARE_TUNNEL_TOKEN`, `BACKEND_URL`, `RESTART_EVERY_HOURS` and `KAGGLE_IDLE_TIMEOUT_SECONDS`
+  are pushed to Kaggle with each new session, so they apply from the **next launch**.
+- Changing `SESSION_WEBHOOK_SECRET` while a session runs makes that session's webhooks fail
+  (401) until it restarts, because the notebook still holds the old value.
+- Changing the Kaggle accounts or `SESSIONS_PER_ACCOUNT` keeps the rotation counter.
+
 ## Local testing
 
 ```bash
@@ -159,3 +175,10 @@ uvicorn main:app --reload
 `POST /session/start` will genuinely try to push to Kaggle if credentials
 are set — use a throwaway kernel id in `kplc-kaggle-notebook/kernel-metadata.json`
 if you just want to test the plumbing.
+
+Tests for the runtime settings (no network or Kaggle needed):
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests
+```

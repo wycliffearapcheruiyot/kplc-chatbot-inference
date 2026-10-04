@@ -44,6 +44,11 @@ Env vars (see .env.example):
                                      otherwise.
     KEEP_ALIVE_WINDOW_UTC         - e.g. "05:00-13:00": only launch inside it.
 
+Every variable above can also be edited live from the admin panel's Environment
+tab (stored in MongoDB, read through app_config.cfg, applied within ~10 s). The
+real environment variable is the fallback. MONGODB_URI must be a real env var:
+it is how this service finds those settings.
+
 Run with a single worker (see README) since session state is in-memory.
 """
 
@@ -61,48 +66,101 @@ from session_manager import SessionManager
 from supervisor import Supervisor
 
 # --- config -----------------------------------------------------------------
+# Everything is read through cfg at the moment it is needed (never frozen at
+# import), so the admin panel's Environment tab takes effect without a redeploy.
 
-KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
-KAGGLE_KEY = os.environ.get("KAGGLE_KEY", "")
-rotation = Rotation(
-    load_accounts(os.environ.get("KAGGLE_ACCOUNTS", ""), KAGGLE_USERNAME, KAGGLE_KEY),
-    sessions_per_account=int(os.environ.get("SESSIONS_PER_ACCOUNT", "3")),
-    skip_after_failures=int(os.environ.get("ACCOUNT_SKIP_AFTER_FAILURES", "3")),
-)
-KAGGLE_KERNEL_PATH = os.environ.get("KAGGLE_KERNEL_PATH", "./kplc-kaggle-notebook")
-SESSION_WEBHOOK_SECRET = os.environ.get("SESSION_WEBHOOK_SECRET", "")
-MODEL_TUNNEL_URL = os.environ.get("MODEL_TUNNEL_URL", "").rstrip("/")
-SESSION_START_TIMEOUT_SECONDS = int(os.environ.get("SESSION_START_TIMEOUT_SECONDS", "600"))
-PROXY_TIMEOUT_SECONDS = int(os.environ.get("PROXY_TIMEOUT_SECONDS", "120"))
+from app_config import cfg
+
+
+def kaggle_kernel_path() -> str:
+    return cfg.get_str("KAGGLE_KERNEL_PATH", "./kplc-kaggle-notebook") or "./kplc-kaggle-notebook"
+
+
+def webhook_secret() -> str:
+    return cfg.get_str("SESSION_WEBHOOK_SECRET")
+
+
+def model_tunnel_url() -> str:
+    return cfg.get_str("MODEL_TUNNEL_URL").rstrip("/")
+
+
+def proxy_timeout() -> int:
+    return cfg.get_int("PROXY_TIMEOUT_SECONDS", 120)
+
+
+def start_timeout() -> int:
+    return cfg.get_int("SESSION_START_TIMEOUT_SECONDS", 600)
+
 
 # This backend's own public URL, handed to serve.py so it knows where to
 # call /session/ready and /session/ended. BACKEND_URL lets you override it;
 # otherwise Render auto-injects RENDER_EXTERNAL_URL, so on Render you don't
 # need to set this by hand at all.
-BACKEND_URL = os.environ.get("BACKEND_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
-CLOUDFLARE_TUNNEL_TOKEN = os.environ.get("CLOUDFLARE_TUNNEL_TOKEN", "")
+def backend_url() -> str:
+    return cfg.get_str("BACKEND_URL") or os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+
+
+def cloudflare_tunnel_token() -> str:
+    return cfg.get_str("CLOUDFLARE_TUNNEL_TOKEN")
+
 
 # --- always-on mode -----------------------------------------------------------
-KEEP_ALIVE = os.environ.get("AUTO_KEEP_ALIVE", "false").strip().lower() in ("1", "true", "yes", "on")
-RESTART_EVERY_HOURS = float(os.environ.get("RESTART_EVERY_HOURS", "8"))
-# Always-on: no idle shutdown (the supervisor would only relaunch it anyway,
-# burning a model load per idle gap). Otherwise keep the original 15 min.
-KAGGLE_IDLE_TIMEOUT_SECONDS = int(
-    os.environ.get("KAGGLE_IDLE_TIMEOUT_SECONDS", "0" if KEEP_ALIVE else "900")
-)
-# Kaggle ends a GPU session at 12h, so a longer cycle can't be honoured.
-MAX_RUNTIME_SECONDS = int(min(RESTART_EVERY_HOURS, 11.5) * 3600) if KEEP_ALIVE else 0
+def keep_alive() -> bool:
+    return cfg.get_bool("AUTO_KEEP_ALIVE", False)
+
+
+def restart_every_hours() -> float:
+    return cfg.get_float("RESTART_EVERY_HOURS", 8.0)
+
+
+def idle_timeout_seconds() -> int:
+    # Always-on: no idle shutdown (the supervisor would only relaunch it anyway,
+    # burning a model load per idle gap). Otherwise keep the original 15 min.
+    return cfg.get_int("KAGGLE_IDLE_TIMEOUT_SECONDS", 0 if keep_alive() else 900)
+
+
+def max_runtime_seconds() -> int:
+    # Kaggle ends a GPU session at 12h, so a longer cycle can't be honoured.
+    return int(min(restart_every_hours(), 11.5) * 3600) if keep_alive() else 0
+
+
+rotation = Rotation([])
+
+
+def sync_rotation() -> str | None:
+    """Applies the current account settings to the rotation (the launch counter
+    is kept). Returns an error message if KAGGLE_ACCOUNTS can't be used."""
+    try:
+        accounts = load_accounts(
+            cfg.get_str("KAGGLE_ACCOUNTS"), cfg.get_str("KAGGLE_USERNAME"), cfg.get_str("KAGGLE_KEY")
+        )
+    except ValueError as e:
+        return str(e)
+    rotation.configure(
+        accounts,
+        sessions_per_account=cfg.get_int("SESSIONS_PER_ACCOUNT", 3),
+        skip_after_failures=cfg.get_int("ACCOUNT_SKIP_AFTER_FAILURES", 3),
+    )
+    return None
+
+
+if not os.environ.get("MONGODB_URI", "").strip():
+    print("WARNING: MONGODB_URI is not set, so the admin panel cannot edit this service's settings "
+          "(it falls back to plain environment variables).", flush=True)
+_accounts_error = sync_rotation()
+if _accounts_error:
+    print(f"WARNING: {_accounts_error}", flush=True)
 
 for name, value in [
-    ("SESSION_WEBHOOK_SECRET", SESSION_WEBHOOK_SECRET),
-    ("MODEL_TUNNEL_URL", MODEL_TUNNEL_URL),
-    ("BACKEND_URL", BACKEND_URL),
-    ("CLOUDFLARE_TUNNEL_TOKEN", CLOUDFLARE_TUNNEL_TOKEN),
+    ("SESSION_WEBHOOK_SECRET", webhook_secret()),
+    ("MODEL_TUNNEL_URL", model_tunnel_url()),
+    ("BACKEND_URL", backend_url()),
+    ("CLOUDFLARE_TUNNEL_TOKEN", cloudflare_tunnel_token()),
 ]:
     if not value:
-        print(f"WARNING: env var {name} is not set. See .env.example.")
+        print(f"WARNING: {name} is not set (env var or admin panel). See .env.example.")
 
-sessions = SessionManager(start_timeout_seconds=SESSION_START_TIMEOUT_SECONDS)
+sessions = SessionManager(start_timeout_seconds=start_timeout)
 
 
 def _launch_session() -> bool:
@@ -112,6 +170,10 @@ def _launch_session() -> bool:
     error) on failure."""
     if not sessions.try_begin_start():
         return False
+    problem = sync_rotation()
+    if problem:
+        sessions.mark_error(problem)
+        raise KagglePushError(problem)
     try:
         number, idx, account = rotation.plan()
     except RuntimeError as e:
@@ -123,17 +185,17 @@ def _launch_session() -> bool:
             account["username"],
             account["key"],
             {
-                "BACKEND_URL": BACKEND_URL,
-                "SESSION_WEBHOOK_SECRET": SESSION_WEBHOOK_SECRET,
-                "CLOUDFLARE_TUNNEL_TOKEN": CLOUDFLARE_TUNNEL_TOKEN,
+                "BACKEND_URL": backend_url(),
+                "SESSION_WEBHOOK_SECRET": webhook_secret(),
+                "CLOUDFLARE_TUNNEL_TOKEN": cloudflare_tunnel_token(),
                 # strings on purpose: serve.py treats "0" as a real value
-                "IDLE_TIMEOUT_SECONDS": str(KAGGLE_IDLE_TIMEOUT_SECONDS),
-                "MAX_RUNTIME_SECONDS": str(MAX_RUNTIME_SECONDS),
+                "IDLE_TIMEOUT_SECONDS": str(idle_timeout_seconds()),
+                "MAX_RUNTIME_SECONDS": str(max_runtime_seconds()),
                 "SESSION_NUMBER": str(number),
             },
         )
         push_kernel(
-            KAGGLE_KERNEL_PATH,
+            kaggle_kernel_path(),
             account["username"],
             account["key"],
             extra_dataset_sources=[secrets_dataset_ref],
@@ -149,18 +211,22 @@ def _launch_session() -> bool:
 supervisor = Supervisor(
     sessions,
     launch=_launch_session,
-    tunnel_url=MODEL_TUNNEL_URL,
+    tunnel_url=model_tunnel_url(),
     rotation=rotation,
-    interval_seconds=int(os.environ.get("SUPERVISOR_INTERVAL_SECONDS", "60")),
-    retry_backoff_seconds=int(os.environ.get("RESTART_RETRY_BACKOFF_SECONDS", "300")),
-    window_spec=os.environ.get("KEEP_ALIVE_WINDOW_UTC", ""),
+    # re-read every loop, so edits in the admin panel apply without a restart
+    settings=lambda: {
+        "enabled": keep_alive(),
+        "tunnel_url": model_tunnel_url(),
+        "interval_seconds": cfg.get_int("SUPERVISOR_INTERVAL_SECONDS", 60),
+        "retry_backoff_seconds": cfg.get_int("RESTART_RETRY_BACKOFF_SECONDS", 300),
+        "window_spec": cfg.get_str("KEEP_ALIVE_WINDOW_UTC"),
+    },
 )
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    if KEEP_ALIVE:
-        supervisor.start()
+    supervisor.start()  # idle unless AUTO_KEEP_ALIVE is true (re-checked every loop)
     yield
     supervisor.stop()
 
@@ -171,7 +237,8 @@ app = FastAPI(title="KPLC Chatbot Backend", lifespan=lifespan)
 # --- auth helper for webhooks called by serve.py -----------------------------
 
 def _check_webhook_secret(x_webhook_secret: str | None):
-    if not SESSION_WEBHOOK_SECRET or x_webhook_secret != SESSION_WEBHOOK_SECRET:
+    expected = webhook_secret()
+    if not expected or x_webhook_secret != expected:
         raise HTTPException(status_code=401, detail="Invalid or missing webhook secret.")
 
 
@@ -230,12 +297,13 @@ def session_ended(
 @app.get("/session/status")
 def session_status():
     snap = sessions.snapshot()
+    sync_rotation()  # so rotation.describe() reflects settings edited in the admin panel
     restart_in = None
-    if KEEP_ALIVE and snap["state"] == "ready" and snap["started_at"]:
-        restart_in = max(0, int(snap["started_at"] + MAX_RUNTIME_SECONDS - time.time()))
+    if keep_alive() and snap["state"] == "ready" and snap["started_at"]:
+        restart_in = max(0, int(snap["started_at"] + max_runtime_seconds() - time.time()))
     return {
         **snap,
-        "keep_alive": KEEP_ALIVE,
+        "keep_alive": keep_alive(),
         "restart_in_seconds": restart_in,
         "rotation": rotation.describe(),
     }
@@ -271,9 +339,9 @@ def generate(req: GenerateRequest):
     _require_ready()
     try:
         resp = httpx.post(
-            f"{MODEL_TUNNEL_URL}/generate",
+            f"{model_tunnel_url()}/generate",
             json=req.model_dump(),
-            timeout=PROXY_TIMEOUT_SECONDS,
+            timeout=proxy_timeout(),
         )
         resp.raise_for_status()
         return resp.json()
@@ -288,9 +356,9 @@ def embed(req: EmbedRequest):
     _require_ready()
     try:
         resp = httpx.post(
-            f"{MODEL_TUNNEL_URL}/embed",
+            f"{model_tunnel_url()}/embed",
             json=req.model_dump(),
-            timeout=PROXY_TIMEOUT_SECONDS,
+            timeout=proxy_timeout(),
         )
         resp.raise_for_status()
         return resp.json()
