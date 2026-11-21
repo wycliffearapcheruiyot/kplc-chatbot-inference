@@ -1,0 +1,14 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+httpx>=0.27.2
+kaggle>=1.6.17
+pydantic>=2.10.0
+pymongo[srv]>=4.7
+# kaggle's own deps -- newer releases stopped declaring them, so install explicitly
+six>=1.16
+python-dateutil
+python-slugify
+tqdm
+bleach
+certifi
+urllib3
